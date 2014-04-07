@@ -1,87 +1,113 @@
 (ns async-web-testing.core
   (:require [clojure.core.async :as a
-             :refer [>! <! >!! <!! chan thread go timeout
+             :refer [>! <! >!! <!! chan thread go timeout close!
                      dropping-buffer]]))
 
 (defmacro wait [ms]
   `(<! (timeout ~ms)))
 
-(defmacro all<!
-  ([])
-  ([ch & rchs]
-   `(let [ch# ~ch
-          rrs# (all<! ~@rchs)]
-     (cons (<! ch#) rrs#))))
+(defn sync! [& chs]
+  `(<! (a/map vector chs)))
 
-(defn make-http-client []
-  (let [c (-> (org.apache.http.impl.nio.client.HttpAsyncClientBuilder/create)
-              (.build))]
-    c))
+(defn fut->ch [^io.netty.channel.ChannelFuture fut]
+  (let [callback-channel (chan)]
+    (.addListener
+      fut
+      (reify io.netty.util.concurrent.GenericFutureListener
+        (operationComplete [_ fut]
+          (>!! callback-channel fut))))
+    callback-channel))
 
+(defn bootstrap []
+  (let [gr (io.netty.channel.nio.NioEventLoopGroup.)]
+    (-> (io.netty.bootstrap.Bootstrap.)
+        (.group gr)
+        (.channel io.netty.channel.socket.nio.NioSocketChannel)
+        (.handler
+         (proxy [io.netty.channel.ChannelInitializer] []
+           (initChannel [sock]
+             ;; do nothing
+             ))))))
 
-(defn exec-http [hc url k finish-ch result-ch]
-  (>!! result-ch {:time (java.util.Date.) :key k :start true :thread (Thread/currentThread)})
-  (.execute
-    hc
-    (org.apache.http.nio.client.methods.HttpAsyncMethods/createGet url)
-    (proxy [org.apache.http.nio.client.methods.AsyncCharConsumer] []
-      (onResponseReceived [response]
-        (>!! result-ch {:time (java.util.Date.) :key k :response nil}))
-      (onCharReceived [buf ioctl]
-        (let [len (.length buf)
-              bs (char-array len)]
-          (.get buf bs)
-          (>!! result-ch {:time (java.util.Date.) :key k
-                          ;:str (String. bs)
-                          :len len})))
-      (buildResult [context]
-        (>!! result-ch {:time (java.util.Date.) :key k :status :result
-                        :context (.toString context)})))
-    (proxy [org.apache.http.concurrent.FutureCallback] []
-      (completed [result]
-        (>!! result-ch {:time (java.util.Date.) :key k :status :completed
-                        :result result})
-        (>!! finish-ch result))
-      (failed [ex]
-        (>!! result-ch {:time (java.util.Date.) :key k :status :failed
-                        :error ex})
-        (>!! finish-ch ex))
-      (cancelled []
-        (>!! result-ch {:time (java.util.Date.) :key k :status :cancelled})
-        (>!! finish-ch ::cancelled)))))
+(defn process-fut [^io.netty.util.concurrent.GenericFutureListener fut]
+  (cond
+    (.isSuccess fut)
+    fut
+    (.isCancelled fut)
+    (throw (IllegalStateException. "cancelled."))
+    :else
+    (throw (IllegalStateException. "failed." (.cause fut)))))
 
-(defn do-http [hc url k result-ch]
-  (a/go
-    (let [ch (chan)]
-      (thread (exec-http hc url k ch result-ch))
-      (<! ch))))
+(defn fc& [fut]
+  (let [ch (chan)]
+    (.addListener
+      fut
+      (reify io.netty.channel.ChannelFutureListener
+        (operationComplete [_ fut]
+          (cond
+            (.isSuccess fut)
+            (do
+              (>!! ch (.channel fut))
+              (close! ch))
+            (.isCancelled fut)
+            (do
+              (>!! ch (java.util.concurrent.CancellationException.
+                        "cancelled"))
+              (close! ch))
+            :else
+            (do
+              (>!! ch (.cause fut))
+              (close! ch))))))
+    ch))
+
+(defmacro <!? [ch]
+  `(let [r# (<! ~ch)]
+     (if (instance? Throwable r#)
+       (throw r#)
+       r#)))
+
 
 (defn hoge []
   (let [result-ch (chan (dropping-buffer 1000000))]
-    (dotimes [i 5]
-      (a/go
-        (with-open [http-client (make-http-client)]
-          (<! (thread (.start http-client)))
-          (let [user-state (atom {})]
-            ;(wait i)
-            (all<!
-              (do-http http-client "http://dev.taka2ru.jp/hod" :a result-ch)
-              (do-http http-client "http://dev.taka2ru.jp/" :b result-ch)
-              (do-http http-client "http://dev.taka2ru.jp/" :c result-ch)
-              (do-http http-client "http://dev.taka2ru.jp/" :d result-ch))
-            (wait 100)
-            (all<!
-              (do-http http-client "http://dev.taka2ru.jp/" :e result-ch)
-              (do-http http-client "http://dev.taka2ru.jp/" :f result-ch)
-              (do-http http-client "http://dev.taka2ru.jp/" :g result-ch)
-              (do-http http-client "http://dev.taka2ru.jp/" :h result-ch))
-            ;(wait 1000)
-            (thread (>!! result-ch @user-state))
-            ))))
+    (go
+      (try
+        (let [b (bootstrap)]
+          (>! result-ch :start)
+          (let [req (doto (io.netty.handler.codec.http.DefaultFullHttpRequest.
+                            io.netty.handler.codec.http.HttpVersion/HTTP_1_1
+                            io.netty.handler.codec.http.HttpMethod/GET
+                            "/trac/private")
+                      (-> (.headers) (.set "Host" "dev.taka2ru.jp"))
+                      (-> (.headers) (.set "Connection" "close")))
+                cf (.connect b "dev.taka2ru.jp" 80)
+                ch (.channel cf)
+                pipe (.pipeline ch)]
+            (.addLast
+              pipe "codec"
+              (io.netty.handler.codec.http.HttpClientCodec.))
+            (.addLast
+              pipe "handler"
+              (proxy [io.netty.channel.SimpleChannelInboundHandler] []
+                (channelRead0 [ctx msg]
+                  (>!! result-ch [:read msg]))))
+            (<!? (fc& cf))
+            (<!? (fc& (.writeAndFlush ch req)))
+            (<! (timeout 1000))
+            (prn ch))
+          (>! result-ch :end))
+        (catch Throwable e
+          (.printStackTrace e)
+          (throw e))
+        (finally
+          (close! result-ch))))
+    
     (with-open [w (clojure.java.io/writer (java.io.File. "hoge.log"))]
+      (prn (java.util.Date.))
       (loop [i 1]
         (when-let [r (<!! result-ch)]
-          (binding [*out* w]
-            (prn i r))
+          (when (instance? Throwable r)
+            (.printStackTrace r))
+          (prn i (java.util.Date.) r)
           (recur (inc i)))))))
+
 
