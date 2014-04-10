@@ -5,5 +5,5 @@
   :dependencies [[org.clojure/clojure "1.5.1"]
                  [org.clojure/core.async "0.1.278.0-76b25b-alpha"]
                  [org.apache.httpcomponents/httpasyncclient "4.0.1"]
-                 [io.netty/netty-all "4.0.17.Final"]])
+                 [org.javassist/javassist "3.18.1-GA"]])
 
